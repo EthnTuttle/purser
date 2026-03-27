@@ -1,0 +1,35 @@
+# Purser — Product Catalog
+# Copy to products.toml and customize with your products.
+# Changes require a daemon restart to take effect.
+
+[[products]]
+id = "heltec-v3-single"
+name = "Heltec V3 Meshtastic Device"
+type = "physical"
+price_usd = "59.99"
+variants = ["single", "3-pack", "5-pack", "10-pack"]
+active = true
+
+[[products]]
+id = "heltec-v3-3pack"
+name = "Heltec V3 Meshtastic Device (3-Pack)"
+type = "physical"
+price_usd = "164.99"
+variants = []
+active = true
+
+[[products]]
+id = "consulting-dev"
+name = "Software Development Consulting"
+type = "service"
+price_usd = "0.00"           # 0.00 = custom quote required
+variants = []
+active = true
+
+[[products]]
+id = "consulting-security"
+name = "Security Assessment"
+type = "service"
+price_usd = "500.00"
+variants = ["basic", "comprehensive"]
+active = true

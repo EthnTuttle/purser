@@ -1,0 +1,47 @@
+# Purser — Daemon Configuration
+# Copy to config.toml and customize.
+
+# Merchant Nostr public key (npub or hex)
+merchant_npub = "npub1..."
+
+# Nostr relays to connect to (2–5 recommended)
+relays = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.nostr.band",
+]
+
+# Payment providers
+[[providers]]
+type = "square"
+methods = ["fiat"]
+api_key_env = "SQUARE_API_KEY"
+
+[[providers]]
+type = "strike"
+methods = ["lightning"]
+api_key_env = "STRIKE_API_KEY"
+
+# Polling configuration (optional — defaults shown)
+[polling]
+initial_interval_secs = 10
+max_interval_secs = 300
+default_payment_expiry_secs = 900      # 15 minutes
+partial_payment_margin_percent = 2.0   # ±2% tolerance
+
+# Per-pubkey rate limits (optional — defaults shown)
+[rate_limits]
+max_orders_per_hour = 10
+max_failures_per_day = 3
+block_duration_hours = 24
+
+# MDK settings (optional — defaults shown)
+[mdk]
+storage_type = "sqlite"                # "sqlite" or "memory"
+key_package_interval_hours = 6
+group_purge_days = 7
+
+# Storage settings (optional — defaults shown)
+[storage]
+db_path = "purser.db"
+db_size_warn_mb = 500
