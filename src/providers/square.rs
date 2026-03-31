@@ -19,16 +19,23 @@ pub struct SquareProvider {
     api_key: String,
     client: reqwest::Client,
     base_url: String,
+    location_id: String,
     default_expiry_secs: u64,
     rate_limit_remaining: AtomicI64,
 }
 
 impl SquareProvider {
-    pub fn new(api_key: String, base_url: Option<String>, expiry_secs: Option<u64>) -> Self {
+    pub fn new(
+        api_key: String,
+        location_id: String,
+        base_url: Option<String>,
+        expiry_secs: Option<u64>,
+    ) -> Self {
         Self {
             api_key,
             client: reqwest::Client::new(),
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            location_id,
             default_expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
             rate_limit_remaining: AtomicI64::new(-1),
         }
@@ -47,6 +54,12 @@ impl SquareProvider {
 /// Convert a dollar-amount string (e.g. "59.99") to cents as i64.
 fn dollars_to_cents(dollars: &str) -> Result<i64> {
     let trimmed = dollars.trim();
+    if trimmed.starts_with('-') {
+        return Err(PurserError::Provider {
+            provider: "square".to_string(),
+            message: format!("negative amount not allowed: '{}'", dollars),
+        });
+    }
     // Split on decimal point
     let parts: Vec<&str> = trimmed.split('.').collect();
     match parts.len() {
@@ -91,7 +104,7 @@ fn dollars_to_cents(dollars: &str) -> Result<i64> {
 }
 
 /// Build the JSON request body for Square's Payment Links API.
-fn build_create_payment_body(order: &ValidatedOrder) -> Result<Value> {
+fn build_create_payment_body(order: &ValidatedOrder, location_id: &str) -> Result<Value> {
     let line_items: Result<Vec<Value>> = order
         .items
         .iter()
@@ -111,7 +124,7 @@ fn build_create_payment_body(order: &ValidatedOrder) -> Result<Value> {
     let body = serde_json::json!({
         "idempotency_key": order.order_id,
         "order": {
-            "location_id": "main",
+            "location_id": location_id,
             "line_items": line_items?
         }
     });
@@ -212,7 +225,7 @@ impl PaymentProvider for SquareProvider {
     }
 
     async fn create_payment(&self, order: &ValidatedOrder) -> Result<ProviderPaymentRequest> {
-        let body = build_create_payment_body(order)?;
+        let body = build_create_payment_body(order, &self.location_id)?;
 
         let url = format!("{}/online-checkout/payment-links", self.base_url);
 
@@ -407,12 +420,13 @@ mod tests {
         assert_eq!(dollars_to_cents("0.01").unwrap(), 1);
         assert_eq!(dollars_to_cents("1000").unwrap(), 100000);
         assert_eq!(dollars_to_cents("1.5").unwrap(), 150);
+        assert!(dollars_to_cents("-10.00").is_err());
     }
 
     #[test]
     fn test_create_payment_request_body() {
         let order = sample_order();
-        let body = build_create_payment_body(&order).unwrap();
+        let body = build_create_payment_body(&order, "LOC_ABC123").unwrap();
 
         // Verify idempotency key
         assert_eq!(body["idempotency_key"], "test-order-001");
@@ -431,8 +445,8 @@ mod tests {
         assert_eq!(items[1]["base_price_money"]["amount"], 999);
         assert_eq!(items[1]["base_price_money"]["currency"], "USD");
 
-        // Verify location_id is present
-        assert_eq!(body["order"]["location_id"], "main");
+        // Verify location_id uses the passed value
+        assert_eq!(body["order"]["location_id"], "LOC_ABC123");
     }
 
     #[test]
@@ -502,7 +516,7 @@ mod tests {
     #[test]
     fn test_expires_at_set() {
         let before = Utc::now();
-        let provider = SquareProvider::new("test-key".to_string(), None, None);
+        let provider = SquareProvider::new("test-key".to_string(), "LOC_TEST".to_string(), None, None);
 
         // Simulate what create_payment does for expiry
         let expires_at =
