@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,7 +17,7 @@ pub struct AppState {
 }
 
 /// A payment that has been created but not yet confirmed/expired.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingPayment {
     pub order_id: String,
     pub customer_pubkey: String,
@@ -32,7 +33,7 @@ pub struct PendingPayment {
     pub group_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingPaymentStatus {
     AwaitingPayment,
     PendingQuote,

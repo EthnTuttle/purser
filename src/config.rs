@@ -24,6 +24,8 @@ pub struct ProviderConfig {
     pub provider_type: String,
     pub methods: Vec<String>,
     pub api_key_env: String,
+    #[serde(default)]
+    pub location_id_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

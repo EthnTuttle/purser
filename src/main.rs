@@ -3,6 +3,8 @@ mod config;
 mod error;
 mod messages;
 mod nostr;
+mod persistence;
+mod pipeline;
 mod polling;
 mod providers;
 mod ratelimit;
