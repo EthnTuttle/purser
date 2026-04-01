@@ -236,9 +236,8 @@ impl PollingEngine {
                         self.pending.write().await.remove(&order_id);
                     }
                     Ok(PaymentStatus::Expired) => {
-                        let _ = self.event_tx.send(PollingEvent::Failed {
+                        let _ = self.event_tx.send(PollingEvent::Expired {
                             order_id: order_id.clone(),
-                            reason: "payment expired (provider reported)".to_string(),
                         }).await;
                         self.pending.write().await.remove(&order_id);
                     }
@@ -733,6 +732,68 @@ mod tests {
             }
             other => panic!("expected Completed, got: {other:?}"),
         }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_error_applies_backoff_without_removal() {
+        let provider: Arc<dyn PaymentProvider> = Arc::new(MockProvider::with_responses(
+            "mock",
+            vec![
+                Err(PurserError::Provider {
+                    provider: "mock".to_string(),
+                    message: "network timeout".to_string(),
+                }),
+                Err(PurserError::Provider {
+                    provider: "mock".to_string(),
+                    message: "network timeout".to_string(),
+                }),
+            ],
+        ));
+        let (engine, _rx) = PollingEngine::new(vec![provider], 2.0);
+
+        let payment = make_pending_payment("order-err", "mock", "100.00");
+        engine.register(&payment).await.unwrap();
+
+        let initial_interval = {
+            let pending = engine.pending.read().await;
+            pending.get("order-err").unwrap().current_interval
+        };
+
+        let handle = tokio::spawn({
+            let pending = Arc::clone(&engine.pending);
+            let providers = Arc::clone(&engine.providers);
+            let event_tx = engine.event_tx.clone();
+            let margin = engine.margin_percent;
+            async move {
+                let eng = PollingEngine {
+                    pending,
+                    providers,
+                    margin_percent: margin,
+                    event_tx,
+                };
+                eng.run().await
+            }
+        });
+
+        // Wait for at least one error poll cycle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Payment should still be pending (not removed).
+        let pending = engine.pending.read().await;
+        let entry = pending.get("order-err");
+        assert!(entry.is_some(), "payment should NOT be removed after check_status error");
+
+        // Backoff should have been applied.
+        if let Some(entry) = entry {
+            assert!(
+                entry.current_interval > initial_interval,
+                "expected backoff after error, interval was {initial_interval:?}, now {:?}",
+                entry.current_interval
+            );
+        }
+        drop(pending);
 
         handle.abort();
     }
