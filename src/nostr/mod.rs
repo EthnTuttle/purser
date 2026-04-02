@@ -1,10 +1,10 @@
 pub mod mdk_trait;
 pub mod mock_mdk;
+pub mod real_mdk;
 
 use crate::error::Result;
 use crate::messages::{PaymentRequest, StatusUpdate};
 use mdk_trait::MdkClient;
-use mock_mdk::MockMdkClient;
 
 /// Handle to the MDK-backed Nostr communication layer.
 /// Delegates all operations through the MdkClient trait.
@@ -13,13 +13,28 @@ pub struct NostrClient {
     relays: Vec<String>,
 }
 
-// TODO: Replace MockMdkClient with real MDK when mdk-core is available
 impl NostrClient {
     /// Initialize with configured relays and storage backend.
-    pub async fn new(relays: &[String], _storage_type: &str) -> Result<Self> {
-        tracing::info!(relay_count = relays.len(), "initializing NostrClient (mock MDK)");
+    ///
+    /// If `merchant_nsec` is provided, uses the real MDK client with MLS encryption
+    /// and Nostr relay I/O. Otherwise, falls back to MockMdkClient (for testing).
+    pub async fn new(relays: &[String], _storage_type: &str, merchant_nsec: Option<&str>) -> Result<Self> {
+        let mdk: Box<dyn MdkClient> = if let Some(nsec) = merchant_nsec {
+            let keys = nostr::Keys::parse(nsec)
+                .map_err(|e| crate::error::PurserError::Mdk(format!("invalid merchant nsec: {e}")))?;
+            tracing::info!(
+                relay_count = relays.len(),
+                merchant_pubkey = %keys.public_key(),
+                "initializing NostrClient (real MDK)"
+            );
+            Box::new(real_mdk::RealMdkClient::new(keys, relays).await?)
+        } else {
+            tracing::info!(relay_count = relays.len(), "initializing NostrClient (mock MDK)");
+            Box::new(mock_mdk::MockMdkClient::new())
+        };
+
         Ok(Self {
-            mdk: Box::new(MockMdkClient::new()),
+            mdk,
             relays: relays.to_vec(),
         })
     }
@@ -93,9 +108,9 @@ impl NostrClient {
 
     /// Get a reference to the underlying MdkClient (for testing).
     #[cfg(test)]
-    fn mock_mdk(&self) -> &MockMdkClient {
+    fn mock_mdk(&self) -> &mock_mdk::MockMdkClient {
         // Safe in tests: we know the concrete type is MockMdkClient
-        let ptr = &*self.mdk as *const dyn MdkClient as *const MockMdkClient;
+        let ptr = &*self.mdk as *const dyn MdkClient as *const mock_mdk::MockMdkClient;
         unsafe { &*ptr }
     }
 }
@@ -108,7 +123,7 @@ mod tests {
     use std::collections::HashMap;
 
     async fn make_client() -> NostrClient {
-        NostrClient::new(&["wss://relay1.example".into(), "wss://relay2.example".into()], "memory")
+        NostrClient::new(&["wss://relay1.example".into(), "wss://relay2.example".into()], "memory", None)
             .await
             .unwrap()
     }
@@ -219,7 +234,7 @@ mod tests {
             "wss://relay2.example".into(),
             "wss://relay3.example".into(),
         ];
-        let client = NostrClient::new(&relays, "memory").await.unwrap();
+        let client = NostrClient::new(&relays, "memory", None).await.unwrap();
         assert_eq!(client.relays().len(), 3);
     }
 

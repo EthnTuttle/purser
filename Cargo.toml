@@ -20,3 +20,7 @@ async-trait = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "adaf261ba8f9aca8e5c3049bc85ac236837af76c" }
+mdk-memory-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "adaf261ba8f9aca8e5c3049bc85ac236837af76c" }
+nostr-sdk = "0.44"
+nostr = { version = "0.44", features = ["std", "nip59"] }
+hex = "0.4"

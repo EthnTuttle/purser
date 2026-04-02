@@ -9,6 +9,7 @@ mod polling;
 mod providers;
 mod ratelimit;
 mod state;
+pub mod test_keys;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,7 +56,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Initialize NostrClient.
     let nostr_client = Arc::new(
-        nostr::NostrClient::new(&config.relays, &config.mdk.storage_type).await?,
+        nostr::NostrClient::new(
+            &config.relays,
+            &config.mdk.storage_type,
+            std::env::var("MERCHANT_NSEC").ok().as_deref(),
+        )
+        .await?,
     );
 
     // 6. Initialize PollingEngine.

@@ -470,7 +470,7 @@ mod tests {
         });
 
         let nostr = Arc::new(
-            NostrClient::new(&["wss://relay.example".to_string()], "memory")
+            NostrClient::new(&["wss://relay.example".to_string()], "memory", None)
                 .await
                 .unwrap(),
         );
