@@ -470,9 +470,7 @@ mod tests {
         });
 
         let nostr = Arc::new(
-            NostrClient::new(&["wss://relay.example".to_string()], "memory", None)
-                .await
-                .unwrap(),
+            NostrClient::new_local(crate::test_keys::TEST_MERCHANT_NSEC).unwrap(),
         );
 
         let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
@@ -731,7 +729,10 @@ mod tests {
             Arc::new(MockProvider::new("mock-fiat", vec![PaymentMethod::Fiat]));
         let ctx = make_context(vec![provider]).await;
 
-        // Seed a pending payment.
+        // Create a real MLS group first.
+        let group_id = ctx.nostr.create_checkout_group("npub1pollc").await.unwrap();
+
+        // Seed a pending payment using the real group ID.
         let pp = PendingPayment {
             order_id: "poll-c-001".to_string(),
             customer_pubkey: "npub1pollc".to_string(),
@@ -743,7 +744,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(15),
             status: PendingPaymentStatus::AwaitingPayment,
-            group_id: "group-poll-c".to_string(),
+            group_id,
         };
         ctx.rate_limiter.set_active_session("npub1pollc");
         ctx.state
@@ -751,8 +752,6 @@ mod tests {
             .write()
             .await
             .insert("poll-c-001".to_string(), pp);
-        // Create the group so send_status_update can find it.
-        ctx.nostr.create_checkout_group("npub1pollc").await.ok();
 
         let event = PollingEvent::Completed {
             order_id: "poll-c-001".to_string(),
@@ -775,6 +774,8 @@ mod tests {
             Arc::new(MockProvider::new("mock-fiat", vec![PaymentMethod::Fiat]));
         let ctx = make_context(vec![provider]).await;
 
+        let group_id = ctx.nostr.create_checkout_group("npub1polle").await.unwrap();
+
         let pp = PendingPayment {
             order_id: "poll-e-001".to_string(),
             customer_pubkey: "npub1polle".to_string(),
@@ -786,7 +787,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(15),
             status: PendingPaymentStatus::AwaitingPayment,
-            group_id: "group-poll-e".to_string(),
+            group_id,
         };
         ctx.rate_limiter.set_active_session("npub1polle");
         ctx.state
@@ -794,7 +795,6 @@ mod tests {
             .write()
             .await
             .insert("poll-e-001".to_string(), pp);
-        ctx.nostr.create_checkout_group("npub1polle").await.ok();
 
         let event = PollingEvent::Expired {
             order_id: "poll-e-001".to_string(),
@@ -813,6 +813,8 @@ mod tests {
             Arc::new(MockProvider::new("mock-fiat", vec![PaymentMethod::Fiat]));
         let ctx = make_context(vec![provider]).await;
 
+        let group_id = ctx.nostr.create_checkout_group("npub1pollf").await.unwrap();
+
         let pp = PendingPayment {
             order_id: "poll-f-001".to_string(),
             customer_pubkey: "npub1pollf".to_string(),
@@ -824,7 +826,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::minutes(15),
             status: PendingPaymentStatus::AwaitingPayment,
-            group_id: "group-poll-f".to_string(),
+            group_id,
         };
         ctx.rate_limiter.set_active_session("npub1pollf");
         ctx.state
@@ -832,7 +834,6 @@ mod tests {
             .write()
             .await
             .insert("poll-f-001".to_string(), pp);
-        ctx.nostr.create_checkout_group("npub1pollf").await.ok();
 
         let event = PollingEvent::Failed {
             order_id: "poll-f-001".to_string(),

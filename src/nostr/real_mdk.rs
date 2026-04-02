@@ -11,22 +11,28 @@ use nostr_sdk::Client;
 use super::mdk_trait::{DecryptedMessage, MdkClient};
 use crate::error::{PurserError, Result};
 
-/// Real MDK client backed by mdk-core for MLS encryption and nostr-sdk for relay I/O.
+/// MDK client backed by mdk-core for real MLS encryption.
+///
+/// Operates in two modes:
+/// - **Relay mode**: connected to Nostr relays for publishing and fetching events.
+/// - **Local mode**: MLS encryption works in-memory without relay I/O.
+///   Used in tests and when no relays are configured. In local mode, `create_group`
+///   generates an ephemeral customer identity so MLS groups are still real.
 pub struct RealMdkClient {
     mdk: MDK<MdkMemoryStorage>,
     merchant_keys: Keys,
-    nostr_client: Client,
+    /// None in local/test mode — relay operations are skipped.
+    nostr_client: Option<Client>,
     relay_urls: Vec<RelayUrl>,
     /// Maps hex-encoded nostr_group_id → MLS GroupId
     groups: Mutex<HashMap<String, GroupId>>,
 }
 
 impl RealMdkClient {
-    /// Create a new RealMdkClient, connect to relays, and publish an initial key package.
-    pub async fn new(merchant_keys: Keys, relays: &[String]) -> Result<Self> {
+    /// Create a relay-connected client. Connects to relays and publishes an initial key package.
+    pub async fn new_with_relays(merchant_keys: Keys, relays: &[String]) -> Result<Self> {
         let mdk = MDK::new(MdkMemoryStorage::default());
 
-        // Parse relay URLs
         let relay_urls: Vec<RelayUrl> = relays
             .iter()
             .filter_map(|r| RelayUrl::parse(r).ok())
@@ -36,7 +42,6 @@ impl RealMdkClient {
             return Err(PurserError::Mdk("no valid relay URLs provided".into()));
         }
 
-        // Create nostr-sdk client with merchant keys for signing
         let nostr_client = Client::new(merchant_keys.clone());
         for url in &relay_urls {
             nostr_client
@@ -49,24 +54,53 @@ impl RealMdkClient {
         let client = Self {
             mdk,
             merchant_keys,
-            nostr_client,
+            nostr_client: Some(nostr_client),
             relay_urls,
             groups: Mutex::new(HashMap::new()),
         };
 
-        // Publish initial key package so customers can find us
         client.create_key_package().await?;
-
         Ok(client)
     }
 
-    /// Get a reference to the underlying nostr-sdk client (for relay subscriptions).
-    pub fn sdk_client(&self) -> &Client {
-        &self.nostr_client
+    /// Create a local-only client for testing. No relay connection — MLS operations
+    /// work in-memory with real encryption but no network I/O.
+    pub fn new_local(merchant_keys: Keys) -> Self {
+        // MDK requires at least one relay URL in group config.
+        // Use a placeholder that is never connected to.
+        let placeholder_relay = RelayUrl::parse("wss://localhost:0").expect("valid relay URL");
+        Self {
+            mdk: MDK::new(MdkMemoryStorage::default()),
+            merchant_keys,
+            nostr_client: None,
+            relay_urls: vec![placeholder_relay],
+            groups: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get the underlying nostr-sdk client (for relay subscriptions). None in local mode.
+    pub fn sdk_client(&self) -> Option<&Client> {
+        self.nostr_client.as_ref()
+    }
+
+    /// Publish an event to relays if connected. No-op in local mode.
+    async fn publish(&self, event: &Event) -> Result<()> {
+        if let Some(client) = &self.nostr_client {
+            client
+                .send_event(event)
+                .await
+                .map_err(|e| PurserError::Nostr(format!("publish: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Fetch the latest key package event (Kind:443) for a given pubkey from relays.
     async fn fetch_key_package(&self, pubkey: &PublicKey) -> Result<Event> {
+        let client = self
+            .nostr_client
+            .as_ref()
+            .ok_or_else(|| PurserError::Mdk("cannot fetch key packages in local mode".into()))?;
+
         use nostr::Filter;
         use std::time::Duration;
 
@@ -75,8 +109,7 @@ impl RealMdkClient {
             .kind(Kind::MlsKeyPackage)
             .limit(1);
 
-        let events = self
-            .nostr_client
+        let events = client
             .fetch_events(filter, Duration::from_secs(10))
             .await
             .map_err(|e| PurserError::Nostr(format!("fetch key packages: {e}")))?;
@@ -86,30 +119,50 @@ impl RealMdkClient {
             .next()
             .ok_or_else(|| PurserError::Mdk(format!("no key package found for {pubkey}")))
     }
+
+    /// Generate a local customer identity and key package event (for local/test mode).
+    fn generate_local_customer_key_package(&self) -> Result<(Keys, Event)> {
+        let customer_keys = Keys::generate();
+        let customer_mdk = MDK::new(MdkMemoryStorage::default());
+
+        let (kp_encoded, tags, _) = customer_mdk
+            .create_key_package_for_event(&customer_keys.public_key(), self.relay_urls.clone())
+            .map_err(|e| PurserError::Mdk(format!("create customer key package: {e}")))?;
+
+        let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_encoded)
+            .tags(tags)
+            .sign_with_keys(&customer_keys)
+            .map_err(|e| PurserError::Nostr(format!("sign customer key package: {e}")))?;
+
+        Ok((customer_keys, kp_event))
+    }
 }
 
 #[async_trait]
 impl MdkClient for RealMdkClient {
     async fn create_group(&self, customer_pubkey: &str) -> Result<String> {
-        // Parse the customer's public key
-        let customer_pk = PublicKey::parse(customer_pubkey)
-            .map_err(|e| PurserError::Mdk(format!("invalid customer pubkey: {e}")))?;
+        // Get the customer's key package — from relay or generated locally
+        let (customer_pk, kp_event) = if self.nostr_client.is_some() {
+            let pk = PublicKey::parse(customer_pubkey)
+                .map_err(|e| PurserError::Mdk(format!("invalid customer pubkey: {e}")))?;
+            let kp = self.fetch_key_package(&pk).await?;
+            (pk, kp)
+        } else {
+            // Local mode: generate ephemeral customer identity
+            let (customer_keys, kp_event) = self.generate_local_customer_key_package()?;
+            (customer_keys.public_key(), kp_event)
+        };
 
-        // Fetch customer's key package from relays
-        let kp_event = self.fetch_key_package(&customer_pk).await?;
-
-        // Create MLS group config for this checkout session
         let config = NostrGroupConfigData::new(
             format!("checkout-{}", uuid::Uuid::new_v4()),
             "Purser checkout session".to_owned(),
-            None, // image_hash
-            None, // image_key
-            None, // image_nonce
+            None,
+            None,
+            None,
             self.relay_urls.clone(),
             vec![self.merchant_keys.public_key(), customer_pk],
         );
 
-        // Create the MLS group with the customer
         let result = self
             .mdk
             .create_group(
@@ -123,29 +176,26 @@ impl MdkClient for RealMdkClient {
         let mls_group_id = GroupId::from_slice(group.mls_group_id.as_slice());
         let nostr_group_id = hex::encode(&group.nostr_group_id);
 
-        // Merge the pending commit to finalize the group locally
         self.mdk
             .merge_pending_commit(&mls_group_id)
             .map_err(|e| PurserError::Mdk(format!("merge pending commit: {e}")))?;
 
-        // Gift-wrap and publish welcome messages to the customer
-        for welcome_rumor in &result.welcome_rumors {
-            let gift_wrapped = EventBuilder::gift_wrap(
-                &self.merchant_keys,
-                &customer_pk,
-                welcome_rumor.clone(),
-                [],
-            )
-            .await
-            .map_err(|e| PurserError::Nostr(format!("gift wrap welcome: {e}")))?;
-
-            self.nostr_client
-                .send_event(&gift_wrapped)
+        // Gift-wrap and publish welcome messages (relay mode only)
+        if self.nostr_client.is_some() {
+            for welcome_rumor in &result.welcome_rumors {
+                let gift_wrapped = EventBuilder::gift_wrap(
+                    &self.merchant_keys,
+                    &customer_pk,
+                    welcome_rumor.clone(),
+                    [],
+                )
                 .await
-                .map_err(|e| PurserError::Nostr(format!("publish welcome: {e}")))?;
+                .map_err(|e| PurserError::Nostr(format!("gift wrap welcome: {e}")))?;
+
+                self.publish(&gift_wrapped).await?;
+            }
         }
 
-        // Track the group mapping
         self.groups
             .lock()
             .unwrap()
@@ -169,24 +219,16 @@ impl MdkClient for RealMdkClient {
             .cloned()
             .ok_or_else(|| PurserError::Mdk(format!("unknown group: {group_id}")))?;
 
-        // Build a Kind:9 rumor with the payload as content
         let rumor = EventBuilder::new(Kind::Custom(9), payload)
             .build(self.merchant_keys.public_key());
 
-        // Encrypt via MLS and get a Kind:445 event
         let message_event = self
             .mdk
             .create_message(&mls_group_id, rumor)
             .map_err(|e| PurserError::Mdk(format!("create message: {e}")))?;
 
-        // Publish to relays
-        self.nostr_client
-            .send_event(&message_event)
-            .await
-            .map_err(|e| PurserError::Nostr(format!("publish message: {e}")))?;
-
-        tracing::debug!(group_id = %group_id, "sent encrypted message to relay");
-
+        self.publish(&message_event).await?;
+        tracing::debug!(group_id = %group_id, "sent encrypted message");
         Ok(())
     }
 
@@ -199,20 +241,14 @@ impl MdkClient for RealMdkClient {
             )
             .map_err(|e| PurserError::Mdk(format!("create key package: {e}")))?;
 
-        // Build and sign the Kind:443 key package event
         let kp_event = EventBuilder::new(Kind::MlsKeyPackage, kp_encoded)
             .tags(tags)
             .sign(&self.merchant_keys)
             .await
             .map_err(|e| PurserError::Nostr(format!("sign key package: {e}")))?;
 
-        // Publish to relays
-        self.nostr_client
-            .send_event(&kp_event)
-            .await
-            .map_err(|e| PurserError::Nostr(format!("publish key package: {e}")))?;
-
-        tracing::info!("published key package to relays");
+        self.publish(&kp_event).await?;
+        tracing::info!("created key package");
         Ok(())
     }
 
@@ -223,10 +259,6 @@ impl MdkClient for RealMdkClient {
     }
 
     async fn purge_stale_groups(&self, _max_age_days: u64) -> Result<()> {
-        // Get all groups from MDK storage and remove old ones
-        // For now, we just clear inactive groups from our tracking map.
-        // Full time-based purge requires MDK group metadata with timestamps,
-        // which can be added when MDK exposes group creation timestamps.
         tracing::debug!("purge_stale_groups called (no-op with memory storage)");
         Ok(())
     }
@@ -236,18 +268,15 @@ impl MdkClient for RealMdkClient {
             .map_err(|e| PurserError::Nostr(format!("deserialize event: {e}")))?;
 
         match event.kind {
-            // Gift-wrapped welcome (NIP-59 Kind:1059)
             Kind::GiftWrap => {
                 let unwrapped = nostr::nips::nip59::extract_rumor(&self.merchant_keys, &event)
                     .await
                     .map_err(|e| PurserError::Mdk(format!("unwrap gift wrap: {e}")))?;
 
-                // Process welcome through MDK
                 self.mdk
                     .process_welcome(&event.id, &unwrapped.rumor)
                     .map_err(|e| PurserError::Mdk(format!("process welcome: {e}")))?;
 
-                // Auto-accept all welcomes (checkout groups are always accepted)
                 let welcomes = self
                     .mdk
                     .get_pending_welcomes(None)
@@ -263,7 +292,6 @@ impl MdkClient for RealMdkClient {
                 Ok(None)
             }
 
-            // MLS encrypted message (Kind:445)
             Kind::MlsGroupMessage => {
                 let result = self
                     .mdk
@@ -280,14 +308,14 @@ impl MdkClient for RealMdkClient {
                         }))
                     }
                     _ => {
-                        tracing::debug!(kind = ?result, "non-application MLS message (commit/proposal)");
+                        tracing::debug!("non-application MLS message (commit/proposal)");
                         Ok(None)
                     }
                 }
             }
 
             other => {
-                tracing::warn!(kind = %other, "unexpected event kind in incoming event");
+                tracing::warn!(kind = %other, "unexpected event kind");
                 Ok(None)
             }
         }

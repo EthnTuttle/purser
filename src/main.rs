@@ -55,13 +55,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(count = providers.len(), "providers initialized");
 
     // 5. Initialize NostrClient.
-    let nostr_client = Arc::new(
-        nostr::NostrClient::new(
-            &config.relays,
-            &config.mdk.storage_type,
-            std::env::var("MERCHANT_NSEC").ok().as_deref(),
+    let merchant_nsec = std::env::var("MERCHANT_NSEC").map_err(|_| {
+        crate::error::PurserError::Config(
+            "MERCHANT_NSEC environment variable not set".to_string(),
         )
-        .await?,
+    })?;
+    let nostr_client = Arc::new(
+        nostr::NostrClient::new(&config.relays, &config.mdk.storage_type, &merchant_nsec)
+            .await?,
     );
 
     // 6. Initialize PollingEngine.
@@ -97,21 +98,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         polling_engine: Arc::clone(&polling_engine),
     });
 
-    // 12. Start relay subscription for incoming orders (real MDK mode)
-    // or create a manual channel (mock mode for testing).
-    let order_rx = if let Some(rx) = nostr_client
+    // 12. Start relay subscription for incoming orders.
+    let order_rx = nostr_client
         .subscribe_orders(&config.merchant_npub)
         .await?
-    {
-        tracing::info!("relay subscription active — listening for encrypted orders");
-        rx
-    } else {
-        // Mock mode: create a channel that nothing writes to (orders come via tests).
-        let (_order_tx, order_rx) = mpsc::channel::<IncomingOrder>(256);
-        // Keep sender alive so receiver doesn't close immediately.
-        std::mem::forget(_order_tx);
-        order_rx
-    };
+        .expect("relay subscription required in daemon mode");
+    tracing::info!("relay subscription active — listening for encrypted orders");
 
     // 13. Create shutdown signal channel.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
