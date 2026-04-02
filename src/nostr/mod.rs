@@ -2,8 +2,11 @@ pub mod mdk_trait;
 pub mod mock_mdk;
 pub mod real_mdk;
 
+use std::sync::Arc;
+
 use crate::error::Result;
 use crate::messages::{PaymentRequest, StatusUpdate};
+use crate::pipeline::IncomingOrder;
 use mdk_trait::MdkClient;
 
 /// Handle to the MDK-backed Nostr communication layer.
@@ -11,6 +14,8 @@ use mdk_trait::MdkClient;
 pub struct NostrClient {
     mdk: Box<dyn MdkClient>,
     relays: Vec<String>,
+    /// nostr-sdk client for relay subscriptions (only present in real MDK mode).
+    sdk_client: Option<nostr_sdk::Client>,
 }
 
 impl NostrClient {
@@ -19,23 +24,27 @@ impl NostrClient {
     /// If `merchant_nsec` is provided, uses the real MDK client with MLS encryption
     /// and Nostr relay I/O. Otherwise, falls back to MockMdkClient (for testing).
     pub async fn new(relays: &[String], _storage_type: &str, merchant_nsec: Option<&str>) -> Result<Self> {
-        let mdk: Box<dyn MdkClient> = if let Some(nsec) = merchant_nsec {
-            let keys = nostr::Keys::parse(nsec)
-                .map_err(|e| crate::error::PurserError::Mdk(format!("invalid merchant nsec: {e}")))?;
-            tracing::info!(
-                relay_count = relays.len(),
-                merchant_pubkey = %keys.public_key(),
-                "initializing NostrClient (real MDK)"
-            );
-            Box::new(real_mdk::RealMdkClient::new(keys, relays).await?)
-        } else {
-            tracing::info!(relay_count = relays.len(), "initializing NostrClient (mock MDK)");
-            Box::new(mock_mdk::MockMdkClient::new())
-        };
+        let (mdk, sdk_client): (Box<dyn MdkClient>, Option<nostr_sdk::Client>) =
+            if let Some(nsec) = merchant_nsec {
+                let keys = nostr::Keys::parse(nsec)
+                    .map_err(|e| crate::error::PurserError::Mdk(format!("invalid merchant nsec: {e}")))?;
+                tracing::info!(
+                    relay_count = relays.len(),
+                    merchant_pubkey = %keys.public_key(),
+                    "initializing NostrClient (real MDK)"
+                );
+                let real = real_mdk::RealMdkClient::new(keys, relays).await?;
+                let client = real.sdk_client().clone();
+                (Box::new(real), Some(client))
+            } else {
+                tracing::info!(relay_count = relays.len(), "initializing NostrClient (mock MDK)");
+                (Box::new(mock_mdk::MockMdkClient::new()), None)
+            };
 
         Ok(Self {
             mdk,
             relays: relays.to_vec(),
+            sdk_client,
         })
     }
 
@@ -99,6 +108,87 @@ impl NostrClient {
     /// Purge stale MLS groups older than the given number of days.
     pub async fn purge_stale_groups(&self, max_age_days: u64) -> Result<()> {
         self.mdk.purge_stale_groups(max_age_days).await
+    }
+
+    /// Start a relay subscription for incoming MLS messages and gift-wrapped welcomes.
+    ///
+    /// Spawns a background task that subscribes to Kind:445 (MLS group messages) and
+    /// Kind:1059 (gift-wrapped welcomes) addressed to the merchant. Decrypted application
+    /// messages are sent as `IncomingOrder` to the returned channel.
+    ///
+    /// Returns `None` in mock mode (no relay subscription needed).
+    pub async fn subscribe_orders(
+        self: &Arc<Self>,
+        merchant_pubkey: &str,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<IncomingOrder>>> {
+        let sdk_client = match &self.sdk_client {
+            Some(c) => c.clone(),
+            None => return Ok(None),
+        };
+
+        let pubkey = nostr::PublicKey::parse(merchant_pubkey)
+            .map_err(|e| crate::error::PurserError::Nostr(format!("parse merchant pubkey: {e}")))?;
+
+        let filter = nostr::Filter::new()
+            .pubkey(pubkey)
+            .kinds(vec![nostr::Kind::MlsGroupMessage, nostr::Kind::GiftWrap]);
+
+        sdk_client
+            .subscribe(filter, None)
+            .await
+            .map_err(|e| crate::error::PurserError::Nostr(format!("subscribe: {e}")))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<IncomingOrder>(256);
+        let nostr_client = Arc::clone(self);
+
+        tokio::spawn(async move {
+            tracing::info!("relay subscription loop started");
+            let handler = sdk_client
+                .handle_notifications(|notification| {
+                    let tx = tx.clone();
+                    let nostr_client = Arc::clone(&nostr_client);
+                    async move {
+                        if let nostr_sdk::RelayPoolNotification::Event { event, .. } = notification
+                        {
+                            let event_json = serde_json::to_vec(&*event).unwrap_or_default();
+                            match nostr_client.process_incoming_event(&event_json).await {
+                                Ok(Some(msg)) => {
+                                    let order = IncomingOrder {
+                                        raw_json: msg.content,
+                                        customer_pubkey: msg.sender_pubkey,
+                                    };
+                                    if tx.send(order).await.is_err() {
+                                        tracing::info!("order channel closed, stopping subscription");
+                                        return Ok(true); // stop
+                                    }
+                                }
+                                Ok(None) => {} // welcome or non-application message
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to process incoming event");
+                                }
+                            }
+                        }
+                        Ok(false) // continue
+                    }
+                })
+                .await;
+
+            if let Err(e) = handler {
+                tracing::error!(error = %e, "relay notification handler error");
+            }
+            tracing::info!("relay subscription loop ended");
+        });
+
+        Ok(Some(rx))
+    }
+
+    /// Process a raw incoming Nostr event through MDK decryption.
+    /// Returns the decrypted content and sender pubkey if it's an application message.
+    pub async fn process_incoming_event(
+        &self,
+        event_json: &[u8],
+    ) -> Result<Option<mdk_trait::DecryptedMessage>> {
+        self.mdk.process_incoming_event(event_json).await
     }
 
     /// Get configured relays.

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::error::Result;
-use super::mdk_trait::MdkClient;
+use super::mdk_trait::{DecryptedMessage, MdkClient};
 
 /// Mock MDK client for development and testing.
 /// Stores groups and messages in memory.
@@ -68,5 +68,10 @@ impl MdkClient for MockMdkClient {
         // Mock: remove all inactive groups
         self.groups.lock().unwrap().retain(|_, active| *active);
         Ok(())
+    }
+
+    async fn process_incoming_event(&self, _event_json: &[u8]) -> Result<Option<DecryptedMessage>> {
+        // Mock: no-op, incoming events are not simulated
+        Ok(None)
     }
 }

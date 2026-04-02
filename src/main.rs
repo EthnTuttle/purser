@@ -97,8 +97,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         polling_engine: Arc::clone(&polling_engine),
     });
 
-    // 12. Create order ingress channel.
-    let (order_tx, order_rx) = mpsc::channel::<IncomingOrder>(256);
+    // 12. Start relay subscription for incoming orders (real MDK mode)
+    // or create a manual channel (mock mode for testing).
+    let order_rx = if let Some(rx) = nostr_client
+        .subscribe_orders(&config.merchant_npub)
+        .await?
+    {
+        tracing::info!("relay subscription active — listening for encrypted orders");
+        rx
+    } else {
+        // Mock mode: create a channel that nothing writes to (orders come via tests).
+        let (_order_tx, order_rx) = mpsc::channel::<IncomingOrder>(256);
+        // Keep sender alive so receiver doesn't close immediately.
+        std::mem::forget(_order_tx);
+        order_rx
+    };
 
     // 13. Create shutdown signal channel.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -133,7 +146,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 15. Wait for SIGTERM/SIGINT.
     tracing::info!("purser daemon running — waiting for shutdown signal");
-    let _ = order_tx; // Keep sender alive; drop below for shutdown.
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

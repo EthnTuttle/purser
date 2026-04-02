@@ -8,7 +8,7 @@ use nostr::event::builder::EventBuilder;
 use nostr::{Event, Keys, Kind, PublicKey, RelayUrl};
 use nostr_sdk::Client;
 
-use super::mdk_trait::MdkClient;
+use super::mdk_trait::{DecryptedMessage, MdkClient};
 use crate::error::{PurserError, Result};
 
 /// Real MDK client backed by mdk-core for MLS encryption and nostr-sdk for relay I/O.
@@ -58,6 +58,11 @@ impl RealMdkClient {
         client.create_key_package().await?;
 
         Ok(client)
+    }
+
+    /// Get a reference to the underlying nostr-sdk client (for relay subscriptions).
+    pub fn sdk_client(&self) -> &Client {
+        &self.nostr_client
     }
 
     /// Fetch the latest key package event (Kind:443) for a given pubkey from relays.
@@ -224,5 +229,67 @@ impl MdkClient for RealMdkClient {
         // which can be added when MDK exposes group creation timestamps.
         tracing::debug!("purge_stale_groups called (no-op with memory storage)");
         Ok(())
+    }
+
+    async fn process_incoming_event(&self, event_json: &[u8]) -> Result<Option<DecryptedMessage>> {
+        let event: Event = serde_json::from_slice(event_json)
+            .map_err(|e| PurserError::Nostr(format!("deserialize event: {e}")))?;
+
+        match event.kind {
+            // Gift-wrapped welcome (NIP-59 Kind:1059)
+            Kind::GiftWrap => {
+                let unwrapped = nostr::nips::nip59::extract_rumor(&self.merchant_keys, &event)
+                    .await
+                    .map_err(|e| PurserError::Mdk(format!("unwrap gift wrap: {e}")))?;
+
+                // Process welcome through MDK
+                self.mdk
+                    .process_welcome(&event.id, &unwrapped.rumor)
+                    .map_err(|e| PurserError::Mdk(format!("process welcome: {e}")))?;
+
+                // Auto-accept all welcomes (checkout groups are always accepted)
+                let welcomes = self
+                    .mdk
+                    .get_pending_welcomes(None)
+                    .map_err(|e| PurserError::Mdk(format!("get pending welcomes: {e}")))?;
+
+                for welcome in &welcomes {
+                    self.mdk
+                        .accept_welcome(welcome)
+                        .map_err(|e| PurserError::Mdk(format!("accept welcome: {e}")))?;
+                    tracing::info!(group_name = %welcome.group_name, "accepted MLS welcome");
+                }
+
+                Ok(None)
+            }
+
+            // MLS encrypted message (Kind:445)
+            Kind::MlsGroupMessage => {
+                let result = self
+                    .mdk
+                    .process_message(&event)
+                    .map_err(|e| PurserError::Mdk(format!("process message: {e}")))?;
+
+                match result {
+                    MessageProcessingResult::ApplicationMessage(msg) => {
+                        let sender = msg.pubkey.to_string();
+                        tracing::debug!(sender = %sender, "decrypted application message");
+                        Ok(Some(DecryptedMessage {
+                            content: msg.content,
+                            sender_pubkey: sender,
+                        }))
+                    }
+                    _ => {
+                        tracing::debug!(kind = ?result, "non-application MLS message (commit/proposal)");
+                        Ok(None)
+                    }
+                }
+            }
+
+            other => {
+                tracing::warn!(kind = %other, "unexpected event kind in incoming event");
+                Ok(None)
+            }
+        }
     }
 }
