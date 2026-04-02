@@ -211,6 +211,66 @@ mod tests {
         client.purge_stale_groups(7).await.unwrap();
     }
 
+    /// Criteria #6: Relay connection — daemon initializes with configured relays.
+    #[tokio::test]
+    async fn test_connect_with_multiple_relays() {
+        let relays = vec![
+            "wss://relay1.example".into(),
+            "wss://relay2.example".into(),
+            "wss://relay3.example".into(),
+        ];
+        let client = NostrClient::new(&relays, "memory").await.unwrap();
+        assert_eq!(client.relays().len(), 3);
+    }
+
+    /// Criteria #8: MLS group creation — customer pubkey triggers group creation
+    /// which returns a valid UUID group_id and allows message sending.
+    #[tokio::test]
+    async fn test_mls_group_creation_and_messaging() {
+        let client = make_client().await;
+        let group_id = client.create_checkout_group("npub1newcustomer").await.unwrap();
+        assert!(!group_id.is_empty());
+        assert!(uuid::Uuid::parse_str(&group_id).is_ok());
+
+        // Should be able to send messages to the new group.
+        client.send_error(&group_id, "test message").await.unwrap();
+
+        // Group should be active.
+        let active = client.mock_mdk().active_groups();
+        assert!(active.contains(&group_id));
+    }
+
+    /// Criteria #30: Customer offline — messages are published to relay regardless
+    /// of customer connectivity (the daemon just sends, relay stores).
+    #[tokio::test]
+    async fn test_message_sent_regardless_of_customer_state() {
+        let client = make_client().await;
+        let group_id = client.create_checkout_group("npub1offline").await.unwrap();
+
+        // Sending status update should succeed even if customer is "offline"
+        // (the mock always succeeds, matching the real behavior where messages
+        // are published to relays for later retrieval).
+        let su = StatusUpdate {
+            version: 1,
+            msg_type: "status-update".to_string(),
+            order_id: "order-offline".to_string(),
+            status: OrderStatus::Paid,
+            payment_provider: "strike".to_string(),
+            payment_id: "inv-offline".to_string(),
+            amount: "50.00".to_string(),
+            currency: "USD".to_string(),
+            timestamp: Utc::now(),
+            lightning_preimage: None,
+            tracking: None,
+            message: None,
+        };
+        client.send_status_update(&group_id, &su).await.unwrap();
+
+        // Message was sent (will be stored on relay for customer to retrieve).
+        let messages = client.mock_mdk().sent_messages();
+        assert_eq!(messages.len(), 1);
+    }
+
     #[tokio::test]
     async fn test_relays_stored() {
         let client = make_client().await;

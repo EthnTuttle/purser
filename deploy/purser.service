@@ -1,0 +1,23 @@
+[Unit]
+Description=Purser Nostr Payment Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=purser
+Group=purser
+ExecStart=/usr/local/bin/purser
+WorkingDirectory=/etc/purser
+EnvironmentFile=/etc/purser/.env
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/purser
+
+[Install]
+WantedBy=multi-user.target

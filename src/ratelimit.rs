@@ -248,6 +248,62 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("blocked"));
     }
 
+    /// Criteria #28 (full): 11th order attempt from same pubkey within 1 hour
+    /// is rejected. The first 10 are accepted (check_order_allowed + record).
+    #[test]
+    fn test_eleventh_order_rejected() {
+        let limiter = RateLimiter::new(default_config());
+        for i in 0..10 {
+            assert!(
+                limiter.check_order_allowed("pubkey-11th").is_ok(),
+                "order {i} should be allowed"
+            );
+            limiter.record_order_attempt("pubkey-11th");
+        }
+        // 11th attempt should be rejected.
+        let result = limiter.check_order_allowed("pubkey-11th");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too many orders"));
+    }
+
+    /// Criteria #29 (full): 4th expired/failed order within 24h triggers a
+    /// 24-hour block AND the pubkey receives a "blocked" error message.
+    /// (Default config: max_failures_per_day = 3.)
+    #[test]
+    fn test_failure_block_triggers_blocked_error() {
+        let limiter = RateLimiter::new(default_config());
+        // Record 3 failures (threshold).
+        for _ in 0..3 {
+            limiter.record_failure("pubkey-block");
+        }
+
+        // Next check should fail with a "blocked" message.
+        let result = limiter.check_order_allowed("pubkey-block");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("blocked"),
+            "expected 'blocked' in error, got: {err_msg}"
+        );
+    }
+
+    /// Criteria #31: Concurrent session rejected with reference to existing
+    /// session (ConcurrentSession error variant carries the pubkey).
+    #[test]
+    fn test_concurrent_session_carries_pubkey() {
+        let limiter = RateLimiter::new(default_config());
+        limiter.set_active_session("pubkey-cs");
+
+        let result = limiter.check_order_allowed("pubkey-cs");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PurserError::ConcurrentSession(pk) => {
+                assert_eq!(pk, "pubkey-cs");
+            }
+            other => panic!("expected ConcurrentSession, got: {other}"),
+        }
+    }
+
     #[test]
     fn test_has_active_session() {
         let limiter = RateLimiter::new(default_config());

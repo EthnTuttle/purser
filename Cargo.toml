@@ -19,5 +19,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
-# MDK dependency — pin to specific commit before implementation begins
-# mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "TBD" }
+mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "adaf261ba8f9aca8e5c3049bc85ac236837af76c" }

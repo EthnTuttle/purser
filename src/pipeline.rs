@@ -846,6 +846,90 @@ mod tests {
         assert!(!ctx.rate_limiter.has_active_session("npub1pollf"));
     }
 
+    /// Criteria #23 (full): Duplicate order from same pubkey with active
+    /// session is rejected as ConcurrentSession (rate limiter runs before
+    /// duplicate check). When session is cleared, the duplicate check returns
+    /// the existing payment-request without creating a new payment.
+    #[tokio::test]
+    async fn test_duplicate_order_returns_existing_payment_request() {
+        let provider: Arc<dyn crate::providers::PaymentProvider> =
+            Arc::new(MockProvider::new("mock-fiat", vec![PaymentMethod::Fiat]));
+        let ctx = make_context(vec![provider]).await;
+
+        // First order succeeds.
+        let json = valid_fiat_order_json("dup-order-001");
+        let result = process_order(&ctx, &json, "npub1dup").await;
+        assert!(result.is_ok());
+
+        // Verify payment is pending.
+        let pending_count = ctx.state.pending_payments.read().await.len();
+        assert_eq!(pending_count, 1);
+
+        // Clear the active session (simulating payment completion or manual clear)
+        // so the duplicate check can run instead of ConcurrentSession.
+        ctx.rate_limiter.clear_active_session("npub1dup");
+
+        // Second order with same order_id — enters duplicate branch, returns
+        // existing payment-request, no new payment created.
+        let result2 = process_order(&ctx, &json, "npub1dup").await;
+        assert!(result2.is_ok(), "duplicate order failed: {:?}", result2.err());
+
+        let pending_count_after = ctx.state.pending_payments.read().await.len();
+        assert_eq!(pending_count_after, 1, "duplicate order should not create a second payment");
+    }
+
+    /// Criteria #18: Processing time < 200ms (daemon overhead, excluding
+    /// external API round-trip — MockProvider returns instantly).
+    #[tokio::test]
+    async fn test_processing_time_under_200ms() {
+        let provider: Arc<dyn crate::providers::PaymentProvider> =
+            Arc::new(MockProvider::new("mock-fiat", vec![PaymentMethod::Fiat]));
+        let ctx = make_context(vec![provider]).await;
+
+        let json = valid_fiat_order_json("timing-order-001");
+        let start = tokio::time::Instant::now();
+        let result = process_order(&ctx, &json, "npub1timing").await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok());
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "processing took {:?}, expected < 200ms",
+            elapsed
+        );
+    }
+
+    /// Criteria #27 (full): Provider returning errors does not crash the pipeline
+    /// and the error is propagated cleanly.
+    #[tokio::test]
+    async fn test_provider_api_down_does_not_crash() {
+        let provider: Arc<dyn crate::providers::PaymentProvider> = Arc::new(
+            MockProvider::new("mock-fiat", vec![PaymentMethod::Fiat]).with_create_response(
+                Err(PurserError::Provider {
+                    provider: "mock-fiat".to_string(),
+                    message: "500 Internal Server Error".to_string(),
+                }),
+            ),
+        );
+        let ctx = make_context(vec![provider]).await;
+
+        let json = valid_fiat_order_json("err-order-001");
+        let result = process_order(&ctx, &json, "npub1err").await;
+
+        // Should propagate as an error, not panic.
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PurserError::Provider { provider, message } => {
+                assert_eq!(provider, "mock-fiat");
+                assert!(message.contains("500"));
+            }
+            other => panic!("expected Provider error, got: {other:?}"),
+        }
+
+        // No pending payments should exist.
+        assert!(ctx.state.pending_payments.read().await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_polling_event_missing_payment() {
         let provider: Arc<dyn crate::providers::PaymentProvider> =

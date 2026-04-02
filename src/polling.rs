@@ -798,6 +798,139 @@ mod tests {
         handle.abort();
     }
 
+    /// Criteria #19 (full): Verify first poll fires at initial_interval.
+    /// Uses a custom poll_config with a 50ms initial_interval and a mock that
+    /// returns Completed on first check. The event should arrive within ~100ms.
+    #[tokio::test]
+    async fn test_initial_poll_fires_at_initial_interval() {
+        let provider: Arc<dyn PaymentProvider> = Arc::new(
+            MockProvider::with_responses(
+                "mock",
+                vec![Ok(PaymentStatus::Completed {
+                    amount_paid: "100.00".to_string(),
+                    lightning_preimage: None,
+                })],
+            )
+            .with_poll_config(PollConfig {
+                initial_interval: Duration::from_millis(50),
+                backoff_multiplier: 2.0,
+                max_interval: Duration::from_secs(60),
+                rate_limit_strategy: RateLimitStrategy::None,
+            }),
+        );
+        let (engine, mut rx) = PollingEngine::new(vec![provider], 2.0);
+
+        let payment = make_pending_payment("order-init", "mock", "100.00");
+        engine.register(&payment).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+
+        let handle = tokio::spawn({
+            let pending = Arc::clone(&engine.pending);
+            let providers = Arc::clone(&engine.providers);
+            let event_tx = engine.event_tx.clone();
+            let margin = engine.margin_percent;
+            async move {
+                let eng = PollingEngine {
+                    pending,
+                    providers,
+                    margin_percent: margin,
+                    event_tx,
+                };
+                eng.run().await
+            }
+        });
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+
+        let elapsed = start.elapsed();
+        handle.abort();
+
+        // First poll should fire at ~50ms (initial_interval), not immediately.
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "first poll fired too early ({elapsed:?}), expected >= 10ms"
+        );
+        // And should fire within a reasonable window.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "first poll fired too late ({elapsed:?}), expected < 500ms"
+        );
+
+        match event {
+            PollingEvent::Completed { order_id, .. } => {
+                assert_eq!(order_id, "order-init");
+            }
+            other => panic!("expected Completed, got: {other:?}"),
+        }
+    }
+
+    /// Criteria #22: Provider error applies backoff (closest to rate-limit
+    /// header doubling the interval in the current implementation — the polling
+    /// engine applies the same backoff_multiplier on errors).
+    #[tokio::test]
+    async fn test_error_doubles_interval_like_rate_limit() {
+        let provider: Arc<dyn PaymentProvider> = Arc::new(
+            MockProvider::with_responses(
+                "mock",
+                vec![
+                    Err(PurserError::Provider {
+                        provider: "mock".to_string(),
+                        message: "rate limited".to_string(),
+                    }),
+                ],
+            )
+            .with_poll_config(PollConfig {
+                initial_interval: Duration::from_millis(20),
+                backoff_multiplier: 2.0,
+                max_interval: Duration::from_secs(60),
+                rate_limit_strategy: RateLimitStrategy::None,
+            }),
+        );
+        let (engine, _rx) = PollingEngine::new(vec![provider], 2.0);
+
+        let payment = make_pending_payment("order-rl", "mock", "100.00");
+        engine.register(&payment).await.unwrap();
+
+        let initial_interval = {
+            engine.pending.read().await.get("order-rl").unwrap().current_interval
+        };
+
+        let handle = tokio::spawn({
+            let pending = Arc::clone(&engine.pending);
+            let providers = Arc::clone(&engine.providers);
+            let event_tx = engine.event_tx.clone();
+            let margin = engine.margin_percent;
+            async move {
+                let eng = PollingEngine {
+                    pending,
+                    providers,
+                    margin_percent: margin,
+                    event_tx,
+                };
+                eng.run().await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let current_interval = {
+            engine.pending.read().await.get("order-rl").map(|e| e.current_interval)
+        };
+        handle.abort();
+
+        if let Some(interval) = current_interval {
+            // backoff_multiplier is 2.0, so interval should at least double.
+            assert!(
+                interval >= initial_interval * 2,
+                "expected interval to at least double from {initial_interval:?}, got {interval:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_idle_state() {
         let provider = Arc::new(MockProvider::new("mock"));

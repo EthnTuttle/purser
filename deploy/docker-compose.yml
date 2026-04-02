@@ -1,0 +1,14 @@
+services:
+  purser:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file: ../.env
+    volumes:
+      - ../config.toml:/etc/purser/config.toml:ro
+      - ../products.toml:/etc/purser/products.toml:ro
+      - purser-data:/var/lib/purser
+    restart: unless-stopped
+
+volumes:
+  purser-data:

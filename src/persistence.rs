@@ -214,6 +214,62 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
+    /// Criteria #32 (full): Graceful shutdown persists pending payments to
+    /// SQLite, simulating the save_all_pending path in main::run().
+    #[test]
+    fn test_graceful_shutdown_persists_all_pending() {
+        let store = PersistenceStore::open(":memory:").unwrap();
+        let payments = vec![
+            sample_payment("shutdown-1"),
+            sample_payment("shutdown-2"),
+        ];
+
+        // Simulate graceful shutdown: save all pending payments.
+        store.save_all_pending(&payments).unwrap();
+
+        // Verify they are persisted.
+        let loaded = store.load_all_pending().unwrap();
+        assert_eq!(loaded.len(), 2);
+        let ids: Vec<&str> = loaded.iter().map(|p| p.order_id.as_str()).collect();
+        assert!(ids.contains(&"shutdown-1"));
+        assert!(ids.contains(&"shutdown-2"));
+    }
+
+    /// Criteria #33 (full): Startup recovery reloads persisted payments.
+    /// Uses a temp file to test actual SQLite persistence across "restart"
+    /// (close + reopen the store).
+    #[test]
+    fn test_startup_recovery_from_file() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("purser_test_recovery_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("recovery.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // First "run": save payments, then drop the store.
+        {
+            let store = PersistenceStore::open(db_str).unwrap();
+            let payments = vec![
+                sample_payment("recover-1"),
+                sample_payment("recover-2"),
+            ];
+            store.save_all_pending(&payments).unwrap();
+        }
+
+        // Second "run": reopen and verify recovery.
+        {
+            let store = PersistenceStore::open(db_str).unwrap();
+            let loaded = store.load_all_pending().unwrap();
+            assert_eq!(loaded.len(), 2);
+            let ids: Vec<&str> = loaded.iter().map(|p| p.order_id.as_str()).collect();
+            assert!(ids.contains(&"recover-1"));
+            assert!(ids.contains(&"recover-2"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_disk_full_resilience() {
         use std::fs;
