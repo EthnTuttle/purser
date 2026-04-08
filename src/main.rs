@@ -224,7 +224,7 @@ fn init_providers(
                 providers.push(Arc::new(SquareProvider::new(
                     api_key,
                     location_id,
-                    None,
+                    pc.base_url.clone(),
                     None,
                 )));
             }

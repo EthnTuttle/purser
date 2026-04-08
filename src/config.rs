@@ -26,6 +26,9 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub location_id_env: Option<String>,
+    /// Optional API base URL override (e.g. Square sandbox: "https://connect.squareupsandbox.com/v2").
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
