@@ -17,5 +17,6 @@
 mod common;
 
 mod fiat_checkout;
+mod graceful_shutdown;
 mod lightning_checkout;
 mod shipping_update;
